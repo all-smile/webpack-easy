@@ -1,91 +1,129 @@
-/**
- * 手写webpack核心打包流程
- */
-// 获取主入口文件
-const fs = require('fs');
-const path = require('path');
-const parser = require('@babel/parser');
-const traverse = require('@babel/traverse').default;
-const babel = require('@babel/core');
+// index.js
 
-// 解析单个文件，获取文件路径，依赖文件列表，编译成es5的代码
-const getModuleInfo = (file) => {
-    const body = fs.readFileSync(path.resolve(__dirname, file), 'utf-8');
-    // 新增代码
-    const ast = parser.parse(body, {
-        sourceType: 'module' // 表示我们要解析的是ES模块
-    });
+const fs = require('fs')
+const path = require('path')
+const options = require('./config') // webpack.config.js
+const parser = require('@babel/parser')
+const traverse = require('@babel/traverse').default
+const { transformFromAst } = require('@babel/core')
 
-    // 新增代码
-    const deps = {};
+const Parser = {
+  getAst: path => {
+    // 读取入口文件
+    const content = fs.readFileSync(path, 'utf-8')
+    // 将文件内容转为AST抽象语法树
+    return parser.parse(content, {
+      sourceType: 'module'
+    })
+  },
+  // 3.找出所有依赖模块
+  getDependecies: (ast, filename) => {
+    const dependecies = {}
+    // 遍历所有的 import 模块,存入dependecies
     traverse(ast, {
-        ImportDeclaration({node}) {
-            const dirname = path.dirname(file);
-            const abspath = './' + path.join(dirname, node.source.value);
-            deps[node.source.value] = abspath;
-        }
-    });
-    const {code} = babel.transformFromAst(ast, null, {
-        presets: ['@babel/preset-env']
-    });
-    const moduleInfo = {file, deps, code};
-    return moduleInfo;
-};
-// 编译入口文件，非递归遍历AST依赖树，将所有文件解析后生成平铺的映射对象
-const parseModules = (file) => {
-    const entry = getModuleInfo(file);
-    const temp = [entry];
-    const depsGraph = {};
-    for (let i = 0; i < temp.length; i++) {
-        const deps = temp[i].deps;
-        if (deps) {
-            for (const key in deps) {
-                if (deps.hasOwnProperty(key)) {
-                    temp.push(getModuleInfo(deps[key]));
-                }
-            }
-        }
-    }
-
-    temp.forEach(moduleInfo => {
-        depsGraph[moduleInfo.file] = {
-            deps: moduleInfo.deps,
-            code: moduleInfo.code
-        };
-    });
-    return depsGraph;
-};
-
-// 打包，递归遍历require
-// 执行依赖关系树的执行器和AST依赖关系树
-const bundle = (file) => {
-    const depsGraph = JSON.stringify(parseModules(file), null, 4);
-    return `;(function (graph) {
-        function require(file) {
-            if (!file) {
-              return
-            }
-            function absRequire(relPath) {
-                return require(graph[file].deps[relPath])
-            }
-            var exports = {};
-            (function (require, exports, code) {
-                eval(code);
-            })(absRequire, exports, graph[file].code);
-            return exports;
-        }
-        require('${file}');
-    })(${depsGraph});`;
-
-};
-
-const entry = './src/index.js';
-const content = bundle(entry);
-
-console.log(content);
-
-// 输出代码
-if (!fs.existsSync('./dist')) {
-    fs.mkdirSync('./dist');
+      // 类型为 ImportDeclaration 的 AST 节点 (即为import 语句)
+      ImportDeclaration({ node }) {
+        const dirname = path.dirname(filename)
+        // 保存依赖模块路径,之后生成依赖关系图需要用到
+        const filepath = './' + path.join(dirname, node.source.value)
+        dependecies[node.source.value] = filepath
+      }
+    })
+    return dependecies
+  },
+  // 4.AST转换为code
+  getCode: ast => {
+    const { code } = transformFromAst(ast, null, {
+      presets: ['@babel/preset-env']
+    })
+    return code
+  }
 }
-fs.writeFileSync('./dist/bundle.js', content);
+
+// 1. 定义Compiler类
+class Compiler {
+  constructor(options) {
+    // webpack 配置
+    const { entry, output } = options
+    // 入口
+    this.entry = entry
+    // 出口
+    this.output = output
+    // 模块
+    this.modules = []
+  }
+  // 构建启动
+  run() {
+    // 2. 解析入口文件,获取 AST
+    const info = this.build(this.entry)
+    console.log('info=',info);
+    this.modules.push(info)
+    this.modules.forEach(({ dependecies }) => {
+      // 判断有依赖对象,递归解析所有依赖项
+      if (dependecies) {
+        for (const dependency in dependecies) {
+          this.modules.push(this.build(dependecies[dependency]))
+        }
+      }
+    })
+
+    console.log('this.modules=', this.modules);
+
+    // 5. 递归解析所有依赖项,生成依赖关系图
+    const dependencyGraph = this.modules.reduce(
+      (graph, item) => ({
+        ...graph,
+        // 使用文件路径作为每个模块的唯一标识符,保存对应模块的依赖对象和文件内容
+        [item.filename]: {
+          dependecies: item.dependecies,
+          code: item.code
+        }
+      }),
+      {}
+    )
+
+    // 6. 重写 require 函数,输出 bundle
+    this.generate(dependencyGraph)
+  }
+  build(filename) {
+    const { getAst, getDependecies, getCode } = Parser
+    // 2. 解析入口文件,获取 AST
+    const ast = getAst(filename)
+    const dependecies = getDependecies(ast, filename)
+    const code = getCode(ast)
+    return {
+      // 文件路径,可以作为每个模块的唯一标识符
+      filename,
+      // 依赖对象,保存着依赖模块路径
+      dependecies,
+      // 文件内容
+      code
+    }
+  }
+  // 重写 require函数 (浏览器不能识别commonjs语法),输出bundle
+  generate(code) {
+    // 输出文件路径
+    const filePath = path.join(this.output.path, this.output.filename)
+    const bundle = `;(function(graph){
+      function require(module){
+        if (!module) {
+          return
+        }
+        function localRequire(relativePath){
+          return require(graph[module].dependecies[relativePath])
+        }
+        var exports = {};
+        (function(require,exports,code){
+          eval(code)
+        })(localRequire,exports,graph[module].code);
+        return exports;
+      }
+      require('${this.entry}')
+    })(${JSON.stringify(code)});`
+
+    // 把文件内容写入到文件系统
+    fs.writeFileSync(filePath, bundle, 'utf-8')
+  }
+}
+
+new Compiler(options).run()
