@@ -6,6 +6,8 @@
 yarn
 
 # 打包 - 生成 dist/bundle.js
+npm run pack
+or
 node index.js
 ```
 
